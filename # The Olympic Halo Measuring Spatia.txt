@@ -1,0 +1,50 @@
+# The Olympic Halo: Measuring Spatial Spillovers of the 2026 Milan-Cortina Games on Mountain Real Estate
+
+## 💡 The Project Idea
+Mega-events like the Winter Olympics bring massive infrastructure investments and global prestige to host cities. While the direct economic impact on the epicenter is well-documented, the "spatial spillover"—how this economic shock ripples outward to neighboring towns—is rarely measured with precision. 
+
+This project investigates the real estate market of Northern Italy following the June 2019 announcement of the 2026 Milan-Cortina Winter Olympics. Using highly granular, neighborhood-level data, this research aims to prove whether proximity to Cortina d'Ampezzo caused a measurable, proportional premium on house prices in the surrounding mountain municipalities. 
+
+By treating the distance to Cortina as a continuous variable, this project moves beyond simple "treated vs. untreated" zones to map the exact geographic decay of an Olympic economic shock.
+
+## 🎯 Core Research Questions
+* Did the 2019 Olympic announcement create a structural break in the trajectory of mountain real estate prices?
+* How does the "Olympic Premium" decay as distance from the host city increases?
+* At what exact kilometer distance does the spillover effect statistically vanish?
+* Are these price dynamics driven by a genuine regional spillover, or are they exclusively fueled by extreme luxury market behavior inside Cortina itself?
+
+## 🧬 Methodological Approach
+To cleanly isolate the Olympic effect from general macroeconomic trends (like the post-COVID mountain housing boom), this project utilizes a **Continuous Difference-in-Differences (DiD) framework**.
+
+* **The Sample:** Restricted exclusively to officially designated mountain municipalities in the Triveneto region. This guarantees a clean control group that shares the exact same baseline alpine characteristics.
+* **The Treatment:** A continuous least-cost path distance metric, calculating the exact driving distance from every local real estate zone to Cortina.
+* **The Controls:** High-dimensional fixed effects (Zone and Province-by-Semester) completely absorb local neighborhood traits and macro-regional policy changes.
+
+## 🗺️ Project Roadmap
+
+### Phase 1: Data Acquisition & Harmonization
+* Download semester-level micro-data from the Osservatorio del Mercato Immobiliare (OMI) covering 2015-2026.
+* Extract official demographic and terrain classifications from ISTAT.
+* Pull municipal tax data (IRPEF) from the Ministry of Economy and Finance.
+* Standardize all geographic keys using official ISTAT municipality codes to ensure clean merging.
+
+### Phase 2: Spatial Engineering & Filtering
+* Filter the national dataset to isolate the Triveneto region.
+* Apply ISTAT altitude classifications to drop all flatland and coastal municipalities.
+* Manually exclude secondary 2026 Olympic clusters (e.g., Val di Fiemme, Anterselva) to prevent control group contamination.
+* Calculate the exact least-cost driving distance from each OMI zone to Cortina d'Ampezzo.
+
+### Phase 3: Exploratory Data Analysis (EDA)
+* Plot the Pre-2019 vs. Post-2019 average house price growth rates against distance for the Province of Belluno.
+* Generate preliminary visual proofs of the parallel trends assumption using a binary distance cutoff.
+* Identify and clean any spatial outliers or failed data merges.
+
+### Phase 4: Econometric Modeling
+* Estimate the baseline Two-Way Fixed Effects (TWFE) regression.
+* Run an Event Study (Dynamic DiD) interacting distance with every single semester to mathematically prove pre-announcement parallel trends.
+* Execute the "Doughnut Specification" robustness check by dropping Cortina from the sample to prove the spillover exists independently of the epicenter.
+
+### Phase 5: Synthesis & Reporting
+* Format regression outputs into publication-ready tables.
+* Polish continuous distance gradient charts.
+* Draft the final research paper, focusing on the literature gap filled by applying spatial micro-econometrics to the 2026 Winter Games.
