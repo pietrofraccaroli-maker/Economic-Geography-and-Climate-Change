@@ -1,0 +1,674 @@
+---
+title: "The Olympic Halo: Spatial Spillovers on Mountain Real Estate"
+author: "Pietro Fraccaroli"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: flatly
+    code_folding: hide
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo    = TRUE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width  = 10,
+  fig.height = 7
+)
+```
+
+```{r libraries}
+library(tidyverse)
+library(sf)
+library(xml2)
+library(ggplot2)
+library(viridis)
+library(scales)
+library(fixest)
+library(patchwork)
+library(here)
+```
+
+---
+
+# 1. Load and Harmonise All OMI Price Data
+
+```{r load-prices}
+raw_dir <- here::here("Raw")
+
+# Parse year and semester from filename: e.g. QIP_1380682_1_20251_VALORI.csv -> 2025, 1
+parse_semester <- function(filepath) {
+  fname <- basename(filepath)
+  m     <- regmatches(fname, regexpr("_(\\d{4})(\\d)_VALORI", fname))
+  year  <- as.integer(substr(m, 2, 5))
+  sem   <- as.integer(substr(m, 6, 6))
+  list(year = year, sem = sem)
+}
+
+valori_files <- list.files(raw_dir, pattern = "_VALORI\\.csv$",
+                           recursive = TRUE, full.names = TRUE)
+
+load_valori <- function(f) {
+  ps <- parse_semester(f)
+  # Row 1 is a title line; row 2 is the header
+  df <- read.csv2(f, skip = 1, header = TRUE,
+                  stringsAsFactors = FALSE, encoding = "UTF-8",
+                  na.strings = c("", "NA", "n.d."))
+  # Drop trailing empty columns produced by trailing semicolons
+  df <- df[, colSums(!is.na(df)) > 0]
+  df$year <- ps$year
+  df$sem  <- ps$sem
+  df
+}
+
+prices_raw <- do.call(rbind, lapply(valori_files, load_valori))
+
+cat("Total rows loaded:", nrow(prices_raw), "\n")
+cat("Semesters:", paste(sort(unique(paste0(prices_raw$year, "/", prices_raw$sem))), collapse = " "), "\n")
+```
+Perché ~44k righe?
+Ogni riga è una combinazione unica di: zona OMI × tipologia immobile × semestre. Belluno ha ~60 comuni, ognuno con 2-6 zone OMI, e per ogni zona ci sono ~8-10 tipologie (abitazioni civili, box, negozi, uffici, capannoni...).
+
+```{r}
+head(prices_raw)
+```
+Colonna	Cosa indica
+Area_territoriale	Macro-area geografica (sempre NORD-EST)
+Regione	            Regione (sempre VENETO)
+Prov	            Sigla provincia (sempre BL = Belluno)
+Comune_ISTAT	    Codice ISTAT del comune (es. 5025006 = Belluno)
+Comune_cat	        Codice catastale del comune (es. D2AA)
+Comune_amm	        Codice belfiore del comune (es. A757 = Belluno, A266 = Cortina) — è la chiave che useremo per il join con i KML
+Comune_descrizione	Nome del comune in chiaro
+Fascia	            Fascia di mercato: B=centrale, D=semicentrale, E=periferica/extraurbana, R=rurale
+Zona	            Codice zona OMI all'interno del comune (es. B1, B2, D3...)
+LinkZona	        Codice univoco nazionale della zona (es. BL00000030)
+Cod_Tip	            Codice tipologia immobile (20=abitazioni civili, 21=economiche, 13=box, 5=negozi...)
+Descr_Tipologia  	Descrizione testuale della tipologia
+Stato	            Stato conservativo: NORMALE, OTTIMO, SCADENTE
+Stato_prev	        Stato prevalente nella zona (P = prevalente)
+Compr_min / Compr_max	Prezzi minimi e massimi di acquisto in €/m²
+Sup_NL_compr	    Superficie di riferimento per compravendita (L = lorda)
+Loc_min / Loc_max	Canoni minimi e massimi di locazione in €/m²/mese
+Sup_NL_loc	        Superficie di riferimento per locazione
+year / sem	        Anno e semestre aggiunti da noi
+```{r clean-prices}
+prices <- prices_raw %>%
+  # Residential civil (Cod_Tip == 20), normal condition
+  filter(Cod_Tip == 20, Stato == "NORMALE") %>%
+  mutate(
+    price_mid = (Compr_min + Compr_max) / 2,           # midpoint purchase price €/m2
+    zone_key  = paste0(Comune_amm, "_", Zona),          # composite key matching KML
+    time      = year + (sem - 1) * 0.5,                 # numeric semester (e.g. 2019.5 = 2019/S2)
+    post      = as.integer(time >= 2019.5)              # Olympic bid announced June 2019
+  ) %>%
+  filter(!is.na(price_mid)) %>%
+  select(year, sem, time, post,
+         Comune_ISTAT, Comune_amm, Comune_descrizione,
+         Fascia, Zona, LinkZona, zone_key,
+         price_mid, Compr_min, Compr_max)
+
+cat("Observations after filter:", nrow(prices), "\n")
+cat("Municipalities:", n_distinct(prices$Comune_amm), "\n")
+cat("Unique zones:  ", n_distinct(prices$zone_key), "\n")
+```
+
+price_mid
+I dati OMI non danno un prezzo esatto ma un intervallo. Es. Belluno zona B1 vale tra 1050 e 1350 €/m². Noi prendiamo il punto medio: (1050+1350)/2 = 1200 €/m². È la nostra variabile dipendente.
+
+zone_key
+Serve per fare il join tra i prezzi e le geometrie KML. Incolla il codice comune con il codice zona:
+
+Comune_amm = A266, Zona = B1 → zone_key = "A266_B1"
+Così ogni riga dei prezzi può essere collegata al poligono geografico corrispondente nel KML
+time
+Converte anno+semestre in un numero continuo per i grafici:
+
+2019/S1 → 2019 + (1-1)×0.5 = 2019.0
+2019/S2 → 2019 + (2-1)×0.5 = 2019.5
+2020/S1 → 2020.0
+2025/S2 → 2025.5
+post
+È la variabile di trattamento del DiD. Le Olimpiadi sono state assegnate a Milano-Cortina il 24 giugno 2019, quindi il primo semestre "trattato" è il 2019/S2 (luglio-dicembre 2019):
+
+Prima del 2019/S2 → post = 0
+Dal 2019/S2 in poi → post = 1
+
+---
+
+# 2. Build Spatial Layer from KML Files
+
+Zone polygons come from the most recent OMI shapefile archive (BL20252.zip).
+OMI zone boundaries change infrequently; this geometry serves as the stable
+spatial reference for the full panel.
+
+```{r read-kml-sf}
+# Disable S2 engine globally before any spatial operation on these KML files.
+# Some OMI polygons have unclosed rings that S2 rejects but GEOS tolerates.
+sf_use_s2(FALSE)
+
+zip_path <- file.path(raw_dir,
+                      "QIP1380683_FRCPTR00T21F861Y",
+                      "BL20252.zip")
+
+tmp_dir <- file.path(tempdir(), "omi_kml")
+dir.create(tmp_dir, showWarnings = FALSE)
+unzip(zip_path, exdir = tmp_dir, overwrite = TRUE)
+
+kml_files <- list.files(tmp_dir, pattern = "\\.kml$", full.names = TRUE)
+cat("KML files extracted:", length(kml_files), "\n")
+
+read_kml_sf <- function(f) {
+  tryCatch({
+    lyr    <- st_layers(f)$name[1]
+    sf_obj <- st_read(f, layer = lyr, quiet = TRUE)
+    if (nrow(sf_obj) == 0) return(NULL)
+    sf_obj %>%
+      mutate(kml_file = basename(f)) %>%
+      select(Name, kml_file, geometry)
+  }, error = function(e) NULL)
+}
+
+zones_sf_raw <- map(kml_files, read_kml_sf) %>%
+  compact() %>%
+  bind_rows()
+
+cat("Zone features read:", nrow(zones_sf_raw), "\n")
+```
+
+```{r fix-broken-geometries}
+# These 6 municipalities have broken geometries in BL20252.zip.
+# We replace their KML features with the equivalent from BL20242.zip.
+broken_codcom <- c("A206", "A982", "B375", "C672", "G404", "G642", "I876")
+
+zip_fallback <- file.path(raw_dir,
+                          "QIP1380681_FRCPTR00T21F861Y",
+                          "BL20242.zip")
+
+tmp_dir2 <- file.path(tempdir(), "omi_kml_fallback")
+dir.create(tmp_dir2, showWarnings = FALSE)
+unzip(zip_fallback, exdir = tmp_dir2, overwrite = TRUE)
+
+kml_fallback <- list.files(tmp_dir2, pattern = "\\.kml$", full.names = TRUE)
+kml_fallback <- kml_fallback[
+  tools::file_path_sans_ext(basename(kml_fallback)) %in% broken_codcom
+]
+
+zones_fallback <- map(kml_fallback, read_kml_sf) %>%
+  compact() %>%
+  bind_rows()
+
+cat("Fallback features read:", nrow(zones_fallback), "\n")
+
+# Replace broken entries in zones_sf_raw with fallback geometries
+zones_sf_raw <- zones_sf_raw %>%
+  filter(!str_remove(kml_file, "\\.kml$") %in% broken_codcom) %>%
+  bind_rows(zones_fallback)
+
+cat("Zone features after fix:", nrow(zones_sf_raw), "\n")
+```
+
+```{r parse-zone-attributes}
+# CODCOM comes from the KML filename (e.g. A266.kml -> A266)
+# CODZONA is the last token after "Zona OMI " in the Placemark Name
+zones_sf <- zones_sf_raw %>%
+  mutate(
+    CODCOM   = str_remove(kml_file, "\\.kml$"),
+    CODZONA  = str_extract(Name, "(?<=Zona OMI )\\S+"),
+    zone_key = paste0(CODCOM, "_", CODZONA)
+  ) %>%
+  filter(!is.na(CODZONA)) %>%
+  st_zm(drop = TRUE) %>%
+  st_make_valid() %>%
+  st_transform(crs = 32632)   # UTM32N for metric distances
+
+cat("Zones with valid attributes:", nrow(zones_sf), "\n")
+
+# Centroids for distance calculation — with bounding box fallback for broken geometries
+safe_centroid_coords <- function(geom) {
+  # Try proper centroid first
+  result <- tryCatch(
+    st_coordinates(st_centroid(geom))[1, 1:2],
+    error = function(e) NULL
+  )
+  if (!is.null(result)) return(result)
+  # Fallback: midpoint of bounding box (works even on topologically broken geometries)
+  tryCatch({
+    bb <- st_bbox(geom)
+    c(X = (bb["xmin"] + bb["xmax"]) / 2,
+      Y = (bb["ymin"] + bb["ymax"]) / 2)
+  }, error = function(e) c(NA_real_, NA_real_))
+}
+
+coords_list <- lapply(zones_sf$geometry, safe_centroid_coords)
+coords_mat  <- do.call(rbind, coords_list)
+
+zone_centroids <- zones_sf %>%
+  st_drop_geometry() %>%
+  mutate(cx = coords_mat[, 1], cy = coords_mat[, 2]) %>%
+  filter(!is.na(cx)) %>%
+  select(zone_key, CODCOM, CODZONA, cx, cy)
+
+cat("Centroids computed:", nrow(zone_centroids), "\n")
+```
+
+---
+
+# 3. Distance to Cortina d'Ampezzo
+
+Cortina's OMI municipality code is **A266**.
+We define the origin as the average centroid of all Cortina OMI zones.
+
+```{r cortina-distance}
+cortina_centroid <- zone_centroids %>%
+  filter(CODCOM == "A266") %>%
+  summarise(cx = mean(cx), cy = mean(cy))
+
+cat("Cortina centroid (UTM32N):", round(cortina_centroid$cx), round(cortina_centroid$cy), "\n")
+
+zone_centroids <- zone_centroids %>%
+  mutate(
+    dist_cortina_km = sqrt(
+      (cx - cortina_centroid$cx)^2 + (cy - cortina_centroid$cy)^2
+    ) / 1000
+  )
+
+summary(zone_centroids$dist_cortina_km)
+```
+
+---
+
+# 4. Build the Analysis Panel
+
+```{r build-panel}
+panel <- prices %>%
+  left_join(zone_centroids, by = "zone_key") %>%
+  filter(!is.na(dist_cortina_km)) %>%
+  mutate(
+    dist_bin = cut(dist_cortina_km,
+                   breaks = c(0, 20, 40, 60, 80, Inf),
+                   labels = c("0-20 km", "20-40 km", "40-60 km",
+                              "60-80 km", ">80 km"),
+                   right  = FALSE),
+    log_price = log(price_mid)
+  )
+
+cat("Panel rows:", nrow(panel), "\n")
+cat("Zones matched:", n_distinct(panel$zone_key), "\n")
+
+
+```
+
+```{r}
+View(panel)
+```
+```{r}
+# Save to Processed folder
+dir.create(here::here("Processed"), showWarnings = FALSE)
+write.csv(panel, here::here("Processed", "panel.csv"), row.names = FALSE)
+write.csv(zone_centroids, here::here("Processed", "zone_centroids.csv"), row.names = FALSE)
+st_write(zones_sf %>% filter(st_is_valid(geometry)),
+         here::here("Processed", "zones_sf.gpkg"),
+         delete_dsn = TRUE, quiet = TRUE)
+cat("Saved to Processed/panel.csv, zone_centroids.csv, zones_sf.gpkg\n")
+```
+---
+
+# 5. Maps
+
+## 5a. Distance Gradient across Belluno Province
+
+```{r}
+zones_map <- zones_sf %>%
+  filter(st_is_valid(geometry)) %>%
+  st_zm(drop = TRUE) %>%
+  left_join(zone_centroids %>% select(zone_key, dist_cortina_km), by = "zone_key")
+
+province_outline <- st_union(zones_map)
+
+```
+```{r map-setup}
+# Load all processed data from disk — no need to re-run spatial pipeline
+panel          <- read.csv(here::here("Processed", "panel.csv"))
+zone_centroids <- read.csv(here::here("Processed", "zone_centroids.csv"))
+zones_sf       <- st_read(here::here("Processed", "zones_sf.gpkg"), quiet = TRUE)
+
+zones_map <- zones_sf %>%
+  left_join(zone_centroids %>% select(zone_key, dist_cortina_km),
+            by = "zone_key")
+
+province_outline <- st_union(zones_map)
+
+cortina_pt <- st_sfc(st_point(c(
+  zone_centroids %>% filter(CODCOM == "A266") %>% summarise(cx = mean(cx)) %>% pull(cx),
+  zone_centroids %>% filter(CODCOM == "A266") %>% summarise(cy = mean(cy)) %>% pull(cy)
+)), crs = 32632)
+```
+
+## 5a. OMI Zones — No Fill
+
+```{r map-zones-plain, fig.height=9}
+ggplot() +
+  geom_sf(data = zones_map,
+          fill = "grey95", colour = "grey40", linewidth = 0.15) +
+  geom_sf(data = province_outline,
+          fill = NA, colour = "black", linewidth = 0.6) +
+  geom_sf(data = cortina_pt,
+          colour = "red", size = 4, shape = 18) +
+  labs(
+    title    = "Belluno Province: OMI Zones",
+    subtitle = "Red diamond = Cortina d'Ampezzo",
+    caption  = "Source: OMI / Agenzia delle Entrate (2025)"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 10, colour = "grey40")
+  )
+```
+
+## 5b. Distance Gradient
+
+```{r map-distance, fig.height=9}
+ggplot() +
+  geom_sf(data = zones_map,
+          aes(fill = dist_cortina_km),
+          colour = "white", linewidth = 0.08) +
+  geom_sf(data = province_outline,
+          fill = NA, colour = "black", linewidth = 0.5) +
+  geom_sf(data = cortina_pt,
+          colour = "red", size = 4, shape = 18) +
+  scale_fill_viridis_c(
+    name      = "Distance to\nCortina (km)",
+    option    = "plasma",
+    direction = -1,
+    na.value  = "grey90"
+  ) +
+  labs(
+    title    = "Belluno Province: OMI Zone Distance to Cortina d'Ampezzo",
+    subtitle = "Red diamond = Cortina centroid | Euclidean distance, UTM32N",
+    caption  = "Source: OMI / Agenzia delle Entrate (2025)"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 10, colour = "grey40"),
+    legend.position = "right"
+  )
+```
+
+## 5b. Most Recent Period Prices (2025/S1)
+
+```{r map-prices-latest, fig.height=9}
+latest_prices <- panel %>%
+  filter(year == 2025, sem == 1) %>%
+  group_by(zone_key) %>%
+  summarise(mean_price = mean(price_mid, na.rm = TRUE), .groups = "drop")
+
+zones_map_prices <- zones_map %>%
+  left_join(latest_prices, by = "zone_key")
+
+ggplot() +
+  geom_sf(data = zones_map_prices,
+          aes(fill = mean_price),
+          colour = "white", linewidth = 0.08) +
+  geom_sf(data = province_outline,
+          fill = NA, colour = "black", linewidth = 0.5) +
+  geom_sf(data = cortina_pt,
+          colour = "white", size = 4, shape = 18) +
+  scale_fill_viridis_c(
+    name     = "Price\n(€/m²)",
+    option   = "inferno",
+    na.value = "grey90"
+  ) +
+  labs(
+    title    = "Residential Purchase Prices — Belluno Province (2025/S1)",
+    subtitle = "Abitazioni civili, Stato NORMALE | White diamond = Cortina",
+    caption  = "Source: OMI / Agenzia delle Entrate (2025)"
+  ) +
+  theme_void() +
+  theme(
+    plot.title    = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 10, colour = "grey40"),
+    legend.position = "right"
+  )
+```
+
+---
+
+# 6. Price Trends by Distance Bin
+
+## 6a. Level Prices Over Time
+
+```{r price-trends}
+trend_df <- panel %>%
+  group_by(time, dist_bin) %>%
+  summarise(mean_price = mean(price_mid, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(dist_bin))
+
+ggplot(trend_df, aes(x = time, y = mean_price,
+                     colour = dist_bin, group = dist_bin)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             colour = "firebrick", linewidth = 0.8) +
+  annotate("text", x = 2019.65,
+           y = max(trend_df$mean_price, na.rm = TRUE) * 0.97,
+           label = "Olympic\nAnnouncement\nJun 2019",
+           hjust = 0, size = 3, colour = "firebrick") +
+  scale_colour_viridis_d(name = "Distance bin", option = "turbo") +
+  scale_y_continuous(labels = label_comma(suffix = " €/m²")) +
+  scale_x_continuous(breaks = seq(2014, 2025, 2)) +
+  labs(
+    title    = "Mean Residential Prices by Distance to Cortina",
+    subtitle = "Province of Belluno — OMI Cod_Tip 20, Stato NORMALE",
+    x = "Semester", y = "Mean price (€/m²)",
+    caption = "Source: OMI / Agenzia delle Entrate (2014–2025)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+```
+
+## 6b. Price Index (Base = 2019/S1)
+
+```{r price-index}
+base_df <- panel %>%
+  filter(year == 2019, sem == 1) %>%
+  group_by(zone_key) %>%
+  summarise(base_price = mean(price_mid, na.rm = TRUE), .groups = "drop")
+
+index_df <- panel %>%
+  left_join(base_df, by = "zone_key") %>%
+  filter(!is.na(base_price), base_price > 0) %>%
+  mutate(price_index = price_mid / base_price * 100) %>%
+  group_by(time, dist_bin) %>%
+  summarise(mean_index = mean(price_index, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(dist_bin))
+
+ggplot(index_df, aes(x = time, y = mean_index,
+                     colour = dist_bin, group = dist_bin)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             colour = "firebrick", linewidth = 0.8) +
+  geom_hline(yintercept = 100, colour = "grey50", linewidth = 0.4) +
+  annotate("text", x = 2019.65, y = 118,
+           label = "Olympic\nAnnouncement",
+           hjust = 0, size = 3, colour = "firebrick") +
+  scale_colour_viridis_d(name = "Distance bin", option = "turbo") +
+  scale_x_continuous(breaks = seq(2014, 2025, 2)) +
+  labs(
+    title    = "Price Index by Distance to Cortina (Base = 2019/S1 = 100)",
+    subtitle = "Highlights divergence in trajectories post-announcement",
+    x = "Semester", y = "Price index",
+    caption = "Source: OMI / Agenzia delle Entrate (2014–2025)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+```
+
+---
+
+# 7. Distance-Price Gradient
+
+## 7a. Pre vs Post Announcement
+
+```{r gradient-plot}
+gradient_df <- panel %>%
+  mutate(period = if_else(post == 0,
+                          "Pre-2019 (2014-2019/S1)",
+                          "Post-2019 (2019/S2-2025/S2)")) %>%
+  group_by(Comune_amm, Comune_descrizione, dist_cortina_km, period) %>%
+  summarise(mean_price = mean(price_mid, na.rm = TRUE), .groups = "drop")
+
+ggplot(gradient_df, aes(x = dist_cortina_km, y = mean_price, colour = period)) +
+  geom_point(alpha = 0.45, size = 1.8) +
+  geom_smooth(method = "loess", span = 0.5, se = TRUE, linewidth = 1.2) +
+  scale_colour_manual(
+    values = c("Pre-2019 (2014-2019/S1)"      = "steelblue",
+               "Post-2019 (2019/S2-2025/S2)"  = "firebrick"),
+    name = NULL
+  ) +
+  scale_y_continuous(labels = label_comma(suffix = " €/m²")) +
+  labs(
+    title    = "Distance-Price Gradient: Pre vs Post Olympic Announcement",
+    subtitle = "Each dot = municipality average across all zones and semesters within period",
+    x = "Euclidean distance to Cortina (km)",
+    y = "Mean price (€/m²)",
+    caption = "Source: OMI / Agenzia delle Entrate (2014–2025)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), legend.position = "top")
+```
+
+## 7b. % Change (Post - Pre) vs Distance
+
+```{r price-change-gradient}
+change_df <- gradient_df %>%
+  pivot_wider(
+    id_cols     = c(Comune_amm, Comune_descrizione, dist_cortina_km),
+    names_from  = period,
+    values_from = mean_price
+  ) %>%
+  rename(
+    pre  = `Pre-2019 (2014-2019/S1)`,
+    post = `Post-2019 (2019/S2-2025/S2)`
+  ) %>%
+  mutate(price_change_pct = (post / pre - 1) * 100) %>%
+  filter(!is.na(price_change_pct))
+
+top_labels <- change_df %>%
+  arrange(desc(abs(price_change_pct))) %>%
+  slice_head(n = 8)
+
+ggplot(change_df, aes(x = dist_cortina_km, y = price_change_pct)) +
+  geom_hline(yintercept = 0, colour = "grey60", linewidth = 0.5) +
+  geom_point(aes(size = abs(price_change_pct)),
+             colour = "steelblue", alpha = 0.6) +
+  geom_smooth(method = "loess", span = 0.5, se = TRUE,
+              colour = "firebrick", linewidth = 1.2, fill = "firebrick") +
+  ggrepel::geom_text_repel(
+    data = top_labels,
+    aes(label = Comune_descrizione),
+    size = 2.8, colour = "grey30", max.overlaps = 15
+  ) +
+  scale_size_continuous(range = c(1, 7), guide = "none") +
+  labs(
+    title    = "% Price Change (Post vs Pre Announcement) by Distance to Cortina",
+    subtitle = "Spatial decay of the Olympic spillover effect",
+    x = "Euclidean distance to Cortina (km)",
+    y = "% price change",
+    caption = "Source: OMI / Agenzia delle Entrate (2014–2025)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank())
+```
+
+---
+
+# 8. Econometric Baseline: TWFE
+
+Two-way fixed effects (zone FE + semester FE).
+Treatment: `dist_cortina_km * post` — the continuous DiD interaction.
+
+```{r twfe}
+reg_df <- panel %>%
+  mutate(
+    treat   = dist_cortina_km * post,
+    zone_fe = zone_key,
+    time_fe = paste0(year, "_", sem)
+  ) %>%
+  filter(!is.na(log_price))
+
+# Model 1: linear distance x post
+m1 <- feols(log_price ~ treat | zone_fe + time_fe,
+            data = reg_df, cluster = ~zone_fe)
+
+# Model 2: log distance x post
+m2 <- feols(log_price ~ I(log1p(dist_cortina_km) * post) | zone_fe + time_fe,
+            data = reg_df, cluster = ~zone_fe)
+
+etable(m1, m2,
+       headers  = c("Linear dist x post", "Log dist x post"),
+       title    = "TWFE Baseline — Dependent Variable: log(price)",
+       digits   = 4)
+```
+
+---
+
+# 9. Event Study (Dynamic DiD)
+
+Interact distance with each semester relative to 2019/S1 to verify
+pre-announcement parallel trends.
+
+```{r event-study}
+reg_df <- reg_df %>%
+  mutate(rel_time = (year - 2019) * 2 + (sem - 1))
+
+m_es <- feols(
+  log_price ~ i(rel_time, dist_cortina_km, ref = 0) | zone_fe + time_fe,
+  data    = reg_df,
+  cluster = ~zone_fe
+)
+
+iplot(m_es,
+      main = "Event Study: Distance x Semester Coefficients",
+      xlab = "Semesters relative to Olympic Announcement (0 = 2019/S1)",
+      ylab = "Coefficient on log price",
+      sub  = "95% CI — clustered SE at zone level")
+abline(v = 0.5, col = "firebrick", lty = 2)
+```
+
+---
+
+# 10. Summary Statistics Table
+
+```{r summary-table}
+panel %>%
+  group_by(dist_bin) %>%
+  summarise(
+    Observations  = n(),
+    Zones         = n_distinct(zone_key),
+    Municipalities = n_distinct(Comune_amm),
+    `Mean price`  = round(mean(price_mid, na.rm = TRUE)),
+    `Median price` = round(median(price_mid, na.rm = TRUE)),
+    `SD price`    = round(sd(price_mid, na.rm = TRUE)),
+    `Mean dist km` = round(mean(dist_cortina_km, na.rm = TRUE), 1),
+    .groups = "drop"
+  ) %>%
+  knitr::kable(
+    caption = "Summary Statistics by Distance Bin to Cortina d'Ampezzo",
+    format.args = list(big.mark = ",")
+  )
+```
+
+---
+
+# Session Info
+
+```{r session-info}
+sessionInfo()
+```
