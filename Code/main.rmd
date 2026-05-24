@@ -30,6 +30,7 @@ library(scales)
 library(fixest)
 library(patchwork)
 library(here)
+library(ggspatial)
 ```
 
 ---
@@ -466,7 +467,7 @@ ggplot() +
 
 ## 5b. Price Heat Map — Spatial Evolution Over Time
 
-```{r map-prices-faceted, fig.height=16, fig.width=10}
+```{r map-prices-faceted, fig.height=9, fig.width=16}
 # Log price for 4 anchor semesters
 get_log_price <- function(yr, sm) {
   panel %>%
@@ -510,12 +511,12 @@ zones_growth <- do.call(rbind, lapply(levels(growth_all$label), function(lbl) {
 ggplot() +
   geom_sf(data = zones_growth,
           aes(fill = log_growth),
-          colour = "white", linewidth = 0.05) +
+          colour = NA) +
   geom_sf(data = province_outline,
           fill = NA, colour = "black", linewidth = 0.4) +
   geom_sf(data = cortina_pt,
-          colour = "black", size = 3, shape = 18) +
-  facet_wrap(~label, ncol = 1) +
+          colour = "red", size = 3, shape = 16) +
+  facet_wrap(~label, ncol = 2) +
   scale_fill_distiller(
     name      = "Log growth\n(≈ % change)",
     palette   = "RdYlGn",
@@ -530,18 +531,32 @@ ggplot() +
     subtitle = "Abitazioni civili, Stato NORMALE | Black diamond = Cortina | Grey = no data",
     caption  = "Source: OMI / Agenzia delle Entrate"
   ) +
+  annotation_north_arrow(
+    location = "tl", which_north = "true",
+    style = north_arrow_fancy_orienteering(
+      fill = c("black", "white"), line_col = "black"
+    ),
+    height = unit(1.2, "cm"), width = unit(1.2, "cm")
+  ) +
+  coord_sf(datum = sf::st_crs(32632)) +
   theme_void(base_size = 11) +
   theme(
-    plot.title       = element_text(size = 14, face = "bold"),
-    plot.subtitle    = element_text(size = 9, colour = "grey40"),
-    strip.text       = element_text(size = 11, face = "bold"),
-    legend.position  = "right",
-    legend.key.height = unit(3, "cm")
+    plot.title          = element_text(size = 14, face = "bold"),
+    plot.subtitle       = element_text(size = 9, colour = "grey40"),
+    strip.text          = element_text(size = 11, face = "bold"),
+    legend.position     = "right",
+    legend.key.height   = unit(3, "cm"),
+    panel.grid.major    = element_line(colour = "grey80", linewidth = 0.3),
+    panel.grid.minor    = element_blank(),
+    axis.text           = element_text(size = 7, colour = "grey50"),
+    axis.text.x         = element_text(angle = 45, hjust = 1),
+    panel.background    = element_rect(fill = "white", colour = NA),
+    plot.background     = element_rect(fill = "white", colour = NA)
   )
 
 dir.create(here::here("Figures"), showWarnings = FALSE)
 ggsave(here::here("Figures", "map_prices_faceted.png"),
-       width = 10, height = 16, dpi = 300)
+       width = 16, height = 9, dpi = 600, bg = "white")
 cat("Saved to Figures/map_prices_faceted.png\n")
 ```
 
