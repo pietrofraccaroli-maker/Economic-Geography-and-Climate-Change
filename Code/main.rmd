@@ -475,30 +475,30 @@ get_log_price <- function(yr, sm) {
     summarise(lp = mean(log(price_mid), na.rm = TRUE), .groups = "drop")
 }
 
-lp_2017S1 <- get_log_price(2017, 1)
+lp_2014S1 <- get_log_price(2014, 1)
 lp_2019S1 <- get_log_price(2019, 1)
 lp_2019S2 <- get_log_price(2019, 2)
-lp_2021S2 <- get_log_price(2021, 2)
+lp_2025S1 <- get_log_price(2025, 1)
 
 # Log growth = log(end) - log(start) ≈ % change
-growth_pre <- lp_2017S1 %>%
+growth_pre <- lp_2014S1 %>%
   inner_join(lp_2019S1, by = "zone_key", suffix = c("_start", "_end")) %>%
   mutate(log_growth = lp_end - lp_start,
-         label = "Pre-announcement\n(2017/S1 → 2019/S1)")
+         label = "Pre-announcement\n(2014/S1 → 2019/S1)")
 
 growth_post <- lp_2019S2 %>%
-  inner_join(lp_2021S2, by = "zone_key", suffix = c("_start", "_end")) %>%
+  inner_join(lp_2025S1, by = "zone_key", suffix = c("_start", "_end")) %>%
   mutate(log_growth = lp_end - lp_start,
-         label = "Post-announcement\n(2019/S2 → 2021/S2)")
+         label = "Post-announcement\n(2019/S2 → 2025/S1)")
 
 growth_all <- bind_rows(growth_pre, growth_post) %>%
   mutate(label = factor(label, levels = c(
-    "Pre-announcement\n(2017/S1 → 2019/S1)",
-    "Post-announcement\n(2019/S2 → 2021/S2)"
+    "Pre-announcement\n(2014/S1 → 2019/S1)",
+    "Post-announcement\n(2019/S2 → 2025/S1)"
   )))
 
-# Symmetric color scale centered at 0
-max_abs <- max(abs(growth_all$log_growth), na.rm = TRUE)
+# Symmetric color scale capped at ±15% (log ≈ 0.15); outliers squished to boundary color
+scale_cap <- 0.05
 
 zones_growth <- do.call(rbind, lapply(levels(growth_all$label), function(lbl) {
   gr <- growth_all %>% filter(label == lbl) %>% select(zone_key, log_growth)
@@ -517,12 +517,13 @@ ggplot() +
           colour = "black", size = 3, shape = 18) +
   facet_wrap(~label, ncol = 1) +
   scale_fill_distiller(
-    name     = "Log growth\n(≈ % change)",
-    palette  = "RdYlGn",
+    name      = "Log growth\n(≈ % change)",
+    palette   = "RdYlGn",
     direction = 1,
-    limits   = c(-max_abs, max_abs),
-    na.value = "grey92",
-    labels   = function(x) paste0(ifelse(x > 0, "+", ""), round(x * 100, 1), "%")
+    limits    = c(-scale_cap, scale_cap),
+    oob       = scales::squish,
+    na.value  = "grey92",
+    labels    = function(x) paste0(ifelse(x > 0, "+", ""), round(x * 100, 1), "%")
   ) +
   labs(
     title    = "Log Price Growth: Before vs After Olympic Announcement",
