@@ -348,7 +348,101 @@ cortina_pt <- st_sfc(st_point(c(
 )), crs = 32632)
 ```
 
-## 5a. OMI Zones — No Fill
+## 5a. Zoom: Cortina d'Ampezzo OMI Zones
+
+```{r map-cortina-zoom, fig.height=8, fig.width=9}
+cortina_zones <- zones_map %>%
+  filter(grepl("^A266_", zone_key)) %>%
+  mutate(zona = sub("A266_", "", zone_key))
+
+cortina_outline <- st_union(cortina_zones)
+
+centroids_coords <- st_coordinates(st_centroid(cortina_zones))
+cortina_zone_labels <- cortina_zones
+cortina_zone_labels$cx <- centroids_coords[, 1]
+cortina_zone_labels$cy <- centroids_coords[, 2]
+
+bbox <- st_bbox(cortina_zones)
+pad  <- 3000  # 3 km padding around Cortina
+
+ggplot() +
+  geom_sf(data = cortina_zones,
+          fill = "steelblue", alpha = 0.25,
+          colour = "steelblue4", linewidth = 0.6) +
+  geom_sf(data = cortina_outline,
+          fill = NA, colour = "black", linewidth = 1.2) +
+  geom_text(data = cortina_zone_labels,
+            aes(x = cx, y = cy, label = zona),
+            size = 4, fontface = "bold", colour = "black") +
+  geom_sf(data = cortina_pt,
+          colour = "red", size = 5, shape = 18) +
+  coord_sf(
+    xlim = c(bbox["xmin"] - pad, bbox["xmax"] + pad),
+    ylim = c(bbox["ymin"] - pad, bbox["ymax"] + pad)
+  ) +
+  labs(
+    title    = "Cortina d'Ampezzo — OMI Zones (A266)",
+    subtitle = "Ogni poligono = una zona OMI | Contorno nero = confine comunale | Diamante rosso = centroide",
+    caption  = "Source: OMI / Agenzia delle Entrate (2025)"
+  ) +
+  theme_void(base_size = 12) +
+  theme(
+    plot.title    = element_text(size = 14, face = "bold"),
+    plot.subtitle = element_text(size = 9, colour = "grey40")
+  )
+```
+
+## 5a-bis. Cortina OMI Zones — Data Coverage Table
+
+```{r cortina-coverage-table}
+total_semesters <- n_distinct(panel$time)
+
+cortina_summary <- panel %>%
+  filter(CODCOM == "A266") %>%
+  group_by(zone_key) %>%
+  summarise(
+    n_semesters   = n_distinct(time),
+    first_period  = min(time),
+    last_period   = max(time),
+    mean_price    = round(mean(price_mid, na.rm = TRUE), 0),
+    min_price     = round(min(price_mid, na.rm = TRUE), 0),
+    max_price     = round(max(price_mid, na.rm = TRUE), 0),
+    .groups = "drop"
+  ) %>%
+  mutate(
+    zona        = sub("A266_", "", zone_key),
+    coverage    = paste0(n_semesters, "/", total_semesters),
+    price_range = paste0(min_price, " – ", max_price, " €/m²")
+  ) %>%
+  arrange(zona) %>%
+  select(zona, coverage, first_period, last_period, mean_price, price_range)
+
+# All A266 zones in geometry (including those with no prices)
+all_cortina_zones <- zones_map %>%
+  filter(grepl("^A266_", zone_key)) %>%
+  mutate(zona = sub("A266_", "", zone_key)) %>%
+  st_drop_geometry() %>%
+  select(zone_key, zona)
+
+coverage_table <- all_cortina_zones %>%
+  left_join(cortina_summary, by = "zona") %>%
+  mutate(
+    coverage   = if_else(is.na(coverage), paste0("0/", total_semesters), coverage),
+    mean_price = if_else(is.na(mean_price), NA_real_, mean_price),
+    price_range = if_else(is.na(price_range), "— nessun dato —", price_range)
+  ) %>%
+  arrange(zona) %>%
+  select(zona, coverage, first_period, last_period, mean_price, price_range)
+
+knitr::kable(
+  coverage_table,
+  col.names = c("Zona OMI", "Semestri con dati", "Primo", "Ultimo",
+                "Prezzo medio (€/m²)", "Range prezzi"),
+  caption = "Cortina d'Ampezzo (A266) — Copertura dati OMI per zona"
+)
+```
+
+## 5b. OMI Zones — No Fill
 
 ```{r map-zones-plain, fig.height=9}
 ggplot() +
@@ -370,37 +464,87 @@ ggplot() +
   )
 ```
 
-## 5b. Distance Gradient
+## 5b. Price Heat Map — Spatial Evolution Over Time
 
-```{r map-distance, fig.height=9}
+```{r map-prices-faceted, fig.height=16, fig.width=10}
+# Log price for 4 anchor semesters
+get_log_price <- function(yr, sm) {
+  panel %>%
+    filter(year == yr, sem == sm) %>%
+    group_by(zone_key) %>%
+    summarise(lp = mean(log(price_mid), na.rm = TRUE), .groups = "drop")
+}
+
+lp_2017S1 <- get_log_price(2017, 1)
+lp_2019S1 <- get_log_price(2019, 1)
+lp_2019S2 <- get_log_price(2019, 2)
+lp_2021S2 <- get_log_price(2021, 2)
+
+# Log growth = log(end) - log(start) ≈ % change
+growth_pre <- lp_2017S1 %>%
+  inner_join(lp_2019S1, by = "zone_key", suffix = c("_start", "_end")) %>%
+  mutate(log_growth = lp_end - lp_start,
+         label = "Pre-announcement\n(2017/S1 → 2019/S1)")
+
+growth_post <- lp_2019S2 %>%
+  inner_join(lp_2021S2, by = "zone_key", suffix = c("_start", "_end")) %>%
+  mutate(log_growth = lp_end - lp_start,
+         label = "Post-announcement\n(2019/S2 → 2021/S2)")
+
+growth_all <- bind_rows(growth_pre, growth_post) %>%
+  mutate(label = factor(label, levels = c(
+    "Pre-announcement\n(2017/S1 → 2019/S1)",
+    "Post-announcement\n(2019/S2 → 2021/S2)"
+  )))
+
+# Symmetric color scale centered at 0
+max_abs <- max(abs(growth_all$log_growth), na.rm = TRUE)
+
+zones_growth <- do.call(rbind, lapply(levels(growth_all$label), function(lbl) {
+  gr <- growth_all %>% filter(label == lbl) %>% select(zone_key, log_growth)
+  zones_map %>%
+    left_join(gr, by = "zone_key") %>%
+    mutate(label = factor(lbl, levels = levels(growth_all$label)))
+}))
+
 ggplot() +
-  geom_sf(data = zones_map,
-          aes(fill = dist_cortina_km),
-          colour = "white", linewidth = 0.08) +
+  geom_sf(data = zones_growth,
+          aes(fill = log_growth),
+          colour = "white", linewidth = 0.05) +
   geom_sf(data = province_outline,
-          fill = NA, colour = "black", linewidth = 0.5) +
+          fill = NA, colour = "black", linewidth = 0.4) +
   geom_sf(data = cortina_pt,
-          colour = "red", size = 4, shape = 18) +
-  scale_fill_viridis_c(
-    name      = "Distance to\nCortina (km)",
-    option    = "plasma",
-    direction = -1,
-    na.value  = "grey90"
+          colour = "black", size = 3, shape = 18) +
+  facet_wrap(~label, ncol = 1) +
+  scale_fill_distiller(
+    name     = "Log growth\n(≈ % change)",
+    palette  = "RdYlGn",
+    direction = 1,
+    limits   = c(-max_abs, max_abs),
+    na.value = "grey92",
+    labels   = function(x) paste0(ifelse(x > 0, "+", ""), round(x * 100, 1), "%")
   ) +
   labs(
-    title    = "Belluno Province: OMI Zone Distance to Cortina d'Ampezzo",
-    subtitle = "Red diamond = Cortina centroid | Euclidean distance, UTM32N",
-    caption  = "Source: OMI / Agenzia delle Entrate (2025)"
+    title    = "Log Price Growth: Before vs After Olympic Announcement",
+    subtitle = "Abitazioni civili, Stato NORMALE | Black diamond = Cortina | Grey = no data",
+    caption  = "Source: OMI / Agenzia delle Entrate"
   ) +
-  theme_void() +
+  theme_void(base_size = 11) +
   theme(
-    plot.title    = element_text(size = 14, face = "bold"),
-    plot.subtitle = element_text(size = 10, colour = "grey40"),
-    legend.position = "right"
+    plot.title       = element_text(size = 14, face = "bold"),
+    plot.subtitle    = element_text(size = 9, colour = "grey40"),
+    strip.text       = element_text(size = 11, face = "bold"),
+    legend.position  = "right",
+    legend.key.height = unit(3, "cm")
   )
+
+dir.create(here::here("Figures"), showWarnings = FALSE)
+ggsave(here::here("Figures", "map_prices_faceted.png"),
+       width = 10, height = 16, dpi = 300)
+cat("Saved to Figures/map_prices_faceted.png\n")
 ```
 
-## 5b. Most Recent Period Prices (2025/S1)
+## 5c. Most Recent Period Prices (2025/S1)
 
 ```{r map-prices-latest, fig.height=9}
 latest_prices <- panel %>%
@@ -509,6 +653,52 @@ ggplot(index_df, aes(x = time, y = mean_log_diff,
   ) +
   theme_minimal(base_size = 12) +
   theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+```
+
+## 6c. Price Index (Base = 2019/S1 = 100)
+
+```{r price-index-level}
+base_df2 <- panel %>%
+  filter(year == 2019, sem == 1) %>%
+  group_by(zone_key) %>%
+  summarise(base_price = mean(price_mid, na.rm = TRUE), .groups = "drop")
+
+index_df2 <- panel %>%
+  left_join(base_df2, by = "zone_key") %>%
+  filter(!is.na(base_price), base_price > 0) %>%
+  mutate(price_index = price_mid / base_price * 100) %>%
+  group_by(time, dist_bin) %>%
+  summarise(mean_index = mean(price_index, na.rm = TRUE), .groups = "drop") %>%
+  filter(!is.na(dist_bin))
+
+p_index <- ggplot(index_df2, aes(x = time, y = mean_index,
+                      colour = dist_bin, group = dist_bin)) +
+  geom_line(linewidth = 0.9) +
+  geom_point(size = 1.8) +
+  geom_vline(xintercept = 2019.5, linetype = "dashed",
+             colour = "firebrick", linewidth = 0.8) +
+  geom_hline(yintercept = 100, colour = "grey50", linewidth = 0.4) +
+  annotate("text", x = 2019.65, y = 118,
+           label = "Olympic\nAnnouncement",
+           hjust = 0, size = 3, colour = "firebrick") +
+  scale_colour_viridis_d(name = "Distance bin", option = "turbo") +
+  scale_x_continuous(breaks = seq(2014, 2025, 2)) +
+  coord_cartesian(ylim = c(95, 105)) +
+  labs(
+    title    = "Price Index by Distance to Cortina (Base = 2019/S1 = 100)",
+    subtitle = "Highlights divergence in trajectories post-announcement",
+    x = "Semester", y = "Price index",
+    caption = "Source: OMI / Agenzia delle Entrate (2014–2025)"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(panel.grid.minor = element_blank(), legend.position = "bottom")
+
+p_index
+
+dir.create(here::here("Figures"), showWarnings = FALSE)
+ggsave(here::here("Figures", "price_index.png"),
+       plot = p_index, width = 10, height = 6, dpi = 300)
+cat("Saved to Figures/price_index.png\n")
 ```
 
 ---
